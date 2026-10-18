@@ -81,7 +81,21 @@
       no_log: true
       changed_when: false
 
-    - name: Deploy each app
+    # ① 收集集群里已有的 helm release（用于幂等比对）
+    - name: Collect existing helm releases
+      ansible.builtin.command: helm list --all-namespaces -o json
+      register: helm_all
+      changed_when: false
+
+    # ② force_pull 时清 chart 缓存（没有这个开关可删）
+    - name: Clear helm OCI chart cache
+      ansible.builtin.file:
+        path: ~/.cache/helm/registry
+        state: absent
+      when: force_pull | default(false)
+
+    # ③ 部署：不带 --wait，失败不中断
+    - name: Deploy each app (no wait, skip on failure)
       ansible.builtin.command: >
         helm upgrade --install {{ item.name }}
         oci://{{ harbor.host }}/{{ item.chart_project }}/{{ item.chart }}
@@ -89,11 +103,47 @@
         --namespace {{ item.namespace }}
         --plain-http
         --set imagePullSecrets[0].name=harbor-pull
+        {% if force_pull | default(false) %}--set image.pullPolicy=Always {% endif %}
         {% for s in item.extra_set | default([]) %}--set {{ s }} {% endfor %}
-        --wait --timeout 5m
+      register: deploy_result
       loop: "{{ apps }}"
       loop_control:
         label: "{{ item.name }}"
+      vars:
+        _existing: >-
+          {{ helm_all.stdout | from_json
+              | selectattr('name', 'equalto', item.name)
+              | selectattr('namespace', 'equalto', item.namespace) | list }}
+      when: >
+        force_pull | default(false) or
+        _existing | length == 0 or
+        _existing[0].chart != item.chart ~ '-' ~ item.version
+      failed_when: false        # ← 失败不中断，继续下一个 app
+
+    # ④ 汇总失败的 app，结尾一次性输出
+    - name: Collect failed apps
+      ansible.builtin.set_fact:
+        deploy_failures: >-
+          {{ deploy_failures | default([]) +
+              [{'name': item.item.name, 'stderr': item.stderr | default('')}] }}
+      loop: "{{ deploy_result.results | default([]) }}"
+      when: item.rc is defined and item.rc != 0
+
+    - name: Deployment summary
+      ansible.builtin.debug:
+        msg: >-
+          {{ '✅ all apps deployed'
+              if deploy_failures | default([]) | length == 0
+              else '❌ FAILED: ' ~ (deploy_failures | map(attribute='name') | join(', ')) }}
+
+    - name: Show failure details
+      ansible.builtin.debug:
+        msg: "{{ item.stderr }}"
+      loop: "{{ deploy_failures | default([]) }}"
+      loop_control:
+        label: "{{ item.name }}"
+      when: deploy_failures | default([]) | length > 0
+
 
     - name: Verify pods in each namespace
       ansible.builtin.command: kubectl -n {{ item }} get pods -o wide
@@ -107,4 +157,3 @@
       loop: "{{ pods.results }}"
       loop_control:
         label: "{{ item.item }}"
-
