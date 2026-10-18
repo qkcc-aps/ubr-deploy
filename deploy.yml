@@ -1,0 +1,110 @@
+---
+# ========== Phase 1: 两台节点配置 CRI-O 信任 Harbor ==========
+- name: Configure CRI-O to trust Harbor
+  hosts: k8s_nodes
+  become: true
+  gather_facts: false
+  tasks:
+    - name: Render Harbor registry config
+      ansible.builtin.template:
+        src: templates/harbor-crio.conf.j2
+        dest: /etc/containers/registries.conf.d/harbor.conf
+        mode: '0644'
+      register: crio_conf
+
+    - name: Restart CRI-O when config changed
+      ansible.builtin.systemd:
+        name: crio
+        state: restarted
+      when: crio_conf.changed
+
+# ========== Phase 2: mgmt 本地 helm 部署所有应用 ==========
+- name: Deploy apps from Harbor
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Check helm binary
+      ansible.builtin.stat:
+        path: /usr/local/bin/helm
+      register: helm_bin
+
+    - name: Check pre-downloaded helm tarball (离线场景)
+      ansible.builtin.stat:
+        path: /tmp/helm.tgz
+      register: helm_tgz
+
+    - name: Download helm if needed
+      ansible.builtin.get_url:
+        url: "{{ helm.url }}/v{{ helm.version }}/helm-v{{ helm.version }}-{{ helm.arch }}.tar.gz"
+        dest: /tmp/helm.tgz
+        mode: '0644'
+      when: not (helm_bin.stat.exists or helm_tgz.stat.exists)
+
+    - name: Extract helm
+      ansible.builtin.unarchive:
+        src: /tmp/helm.tgz
+        dest: /tmp
+        remote_src: true
+      when: not helm_bin.stat.exists
+
+    - name: Install helm binary
+      ansible.builtin.copy:
+        src: "/tmp/{{ helm.arch }}/helm"
+        dest: /usr/local/bin/helm
+        mode: '0755'
+        remote_src: true
+      when: not helm_bin.stat.exists
+
+    - name: Helm login to Harbor
+      ansible.builtin.shell: |
+        echo '{{ harbor.password }}' | helm registry login {{ harbor.host }} \
+          --username {{ harbor.user }} --password-stdin --plain-http
+      no_log: true
+      changed_when: false
+
+    - name: Ensure namespaces exist
+      ansible.builtin.command: kubectl create ns {{ item }}
+      loop: "{{ apps | map(attribute='namespace') | unique | list }}"
+      register: ns_create
+      failed_when: ns_create.rc != 0 and 'AlreadyExists' not in ns_create.stderr
+      changed_when: ns_create.rc == 0
+
+    - name: Create imagePullSecret in each namespace
+      ansible.builtin.shell: |
+        kubectl -n {{ item }} create secret docker-registry harbor-pull \
+          --docker-server={{ harbor.host }} \
+          --docker-username={{ harbor.user }} \
+          --docker-password='{{ harbor.password }}' \
+          --dry-run=client -o yaml | kubectl apply -f -
+      loop: "{{ apps | map(attribute='namespace') | unique | list }}"
+      no_log: true
+      changed_when: false
+
+    - name: Deploy each app
+      ansible.builtin.command: >
+        helm upgrade --install {{ item.name }}
+        oci://{{ harbor.host }}/{{ item.chart_project }}/{{ item.chart }}
+        --version {{ item.version }}
+        --namespace {{ item.namespace }}
+        --plain-http
+        --set imagePullSecrets[0].name=harbor-pull
+        {% for s in item.extra_set | default([]) %}--set {{ s }} {% endfor %}
+        --wait --timeout 5m
+      loop: "{{ apps }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Verify pods in each namespace
+      ansible.builtin.command: kubectl -n {{ item }} get pods -o wide
+      loop: "{{ apps | map(attribute='namespace') | unique | list }}"
+      changed_when: false
+      register: pods
+
+    - name: Show pods
+      ansible.builtin.debug:
+        msg: "{{ item.stdout_lines }}"
+      loop: "{{ pods.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
